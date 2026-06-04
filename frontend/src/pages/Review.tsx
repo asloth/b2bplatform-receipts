@@ -21,7 +21,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Progress } from '@/components/ui/progress'
-import { Dialog, DialogContent } from '@/components/ui/dialog'
+import { Dialog as DialogPrimitive } from '@base-ui/react/dialog'
 import {
   Table,
   TableBody,
@@ -308,8 +308,10 @@ export default function Review() {
       </Card>
 
       {/* Full-screen review dialog */}
-      <Dialog open={open} onOpenChange={(v) => !submitting && setOpen(v)}>
-        <DialogContent className="max-w-[95vw] w-[95vw] h-[92vh] p-0 gap-0 overflow-hidden">
+      <DialogPrimitive.Root open={open} onOpenChange={(v) => !submitting && setOpen(v)}>
+        <DialogPrimitive.Portal>
+          <DialogPrimitive.Backdrop className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm" />
+          <DialogPrimitive.Popup className="fixed inset-4 z-50 flex flex-col rounded-xl bg-background shadow-2xl ring-1 ring-border overflow-hidden outline-none">
           {/* Dialog header */}
           <div className="flex items-center justify-between px-6 py-4 border-b shrink-0">
             <div className="flex items-center gap-3">
@@ -382,7 +384,7 @@ export default function Review() {
             </div>
 
             {/* Right — fields */}
-            <div className="w-[420px] shrink-0 flex flex-col overflow-hidden">
+            <div className="w-[38%] min-w-[300px] max-w-[460px] shrink-0 flex flex-col overflow-hidden border-l">
               {detailLoading ? (
                 <div className="p-6 space-y-4">
                   {[1, 2, 3, 4].map((i) => <Skeleton key={i} className="h-16 w-full" />)}
@@ -402,6 +404,7 @@ export default function Review() {
 
                       {flaggedFields.map((field) => {
                         const pct = Math.round(field.confidence * 100)
+                        const hasValue = !!(corrections[field.field_name] ?? field.normalised_value ?? field.raw_value)
                         return (
                           <div key={field.field_name} className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 space-y-2">
                             <div className="flex items-center justify-between">
@@ -410,9 +413,19 @@ export default function Review() {
                               </label>
                               <ConfidenceBar value={field.confidence} />
                             </div>
-                            {pct === 0 && (
+                            {pct === 0 && !hasValue && (
                               <p className="text-xs text-red-600 font-medium">
-                                ⚠ Not detected — enter the value from the document
+                                Not detected — enter the value from the document
+                              </p>
+                            )}
+                            {pct === 0 && hasValue && (
+                              <p className="text-xs text-amber-700">
+                                Low confidence — verify this value against the document
+                              </p>
+                            )}
+                            {pct > 0 && pct < 85 && (
+                              <p className="text-xs text-amber-700">
+                                Partial confidence — check this looks correct
                               </p>
                             )}
                             <Input
@@ -492,8 +505,9 @@ export default function Review() {
               </div>
             </div>
           </div>
-        </DialogContent>
-      </Dialog>
+        </DialogPrimitive.Popup>
+        </DialogPrimitive.Portal>
+      </DialogPrimitive.Root>
     </div>
   )
 }
