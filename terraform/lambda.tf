@@ -81,6 +81,33 @@ resource "aws_lambda_function" "review" {
   }
 }
 
+data "archive_file" "assistant" {
+  type        = "zip"
+  source_dir  = "${path.module}/../src/assistant"
+  output_path = "/tmp/${var.project_prefix}-assistant.zip"
+}
+
+resource "aws_lambda_function" "assistant" {
+  function_name    = "${var.project_prefix}-assistant-${var.environment}"
+  role             = aws_iam_role.lambda.arn
+  handler          = "handler.handler"
+  runtime          = "python3.12"
+  filename         = data.archive_file.assistant.output_path
+  source_code_hash = data.archive_file.assistant.output_base64sha256
+  memory_size      = 256
+  timeout          = 30
+
+  environment {
+    variables = {
+      DB_CLUSTER_ARN   = aws_rds_cluster.aurora.arn
+      DB_SECRET_ARN    = aws_rds_cluster.aurora.master_user_secret[0].secret_arn
+      DB_NAME          = "invoices"
+      BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+      BEDROCK_REGION   = var.bedrock_region
+    }
+  }
+}
+
 resource "aws_lambda_event_source_mapping" "worker_sqs" {
   event_source_arn = aws_sqs_queue.ingestion.arn
   function_name    = aws_lambda_function.worker.arn

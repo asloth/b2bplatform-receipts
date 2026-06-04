@@ -1,8 +1,9 @@
 import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom'
 import { Toaster } from '@/components/ui/sonner'
-import { UploadCloud, ClipboardList, FileStack } from 'lucide-react'
+import { UploadCloud, ClipboardList, FileStack, Sparkles } from 'lucide-react'
 import Upload from '@/pages/Upload'
 import Review from '@/pages/Review'
+import Chat from '@/pages/Chat'
 import { cn } from '@/lib/utils'
 
 function Nav() {
@@ -32,6 +33,10 @@ function Nav() {
             <ClipboardList className="h-4 w-4" />
             Review Queue
           </NavLink>
+          <NavLink to="/chat" className={linkClass}>
+            <Sparkles className="h-4 w-4" />
+            Assistant
+          </NavLink>
         </nav>
       </div>
     </header>
@@ -48,6 +53,7 @@ export default function App() {
             <Route path="/" element={<Navigate to="/upload" replace />} />
             <Route path="/upload" element={<Upload />} />
             <Route path="/review" element={<Review />} />
+            <Route path="/chat" element={<Chat />} />
           </Routes>
         </main>
       </div>

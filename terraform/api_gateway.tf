@@ -80,6 +80,30 @@ resource "aws_apigatewayv2_route" "review_resolve" {
   target    = "integrations/${aws_apigatewayv2_integration.review.id}"
 }
 
+# ── Assistant (conversational query) ─────────────────────────────────────────
+
+resource "aws_apigatewayv2_integration" "assistant" {
+  api_id                 = aws_apigatewayv2_api.main.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.assistant.invoke_arn
+  integration_method     = "POST"
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "assistant" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "POST /assist/query"
+  target    = "integrations/${aws_apigatewayv2_integration.assistant.id}"
+}
+
+resource "aws_lambda_permission" "api_gateway_assistant" {
+  statement_id  = "AllowAPIGatewayInvokeAssistant"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.assistant.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
+}
+
 resource "aws_lambda_permission" "api_gateway_review" {
   statement_id  = "AllowAPIGatewayInvokeReview"
   action        = "lambda:InvokeFunction"

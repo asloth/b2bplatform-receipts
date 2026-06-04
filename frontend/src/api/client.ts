@@ -27,6 +27,28 @@ export async function getReviewTask(taskId: string): Promise<ReviewTaskDetail> {
   return request(`/review/tasks/${taskId}`)
 }
 
+export interface ChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface ChatResponse {
+  answer: string
+  sql: string | null
+  rows: Record<string, unknown>[] | null
+}
+
+export async function sendChatMessage(
+  question: string,
+  history: ChatMessage[],
+): Promise<ChatResponse> {
+  return request('/assist/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question, history }),
+  })
+}
+
 export async function getInvoicePreview(invoiceId: string): Promise<{ url: string }> {
   return request(`/invoices/${invoiceId}/preview`)
 }
