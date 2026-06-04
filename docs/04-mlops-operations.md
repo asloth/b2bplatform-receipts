@@ -162,4 +162,129 @@ Each tenant has a configurable monthly AI budget (stored in `tenants.config`). T
 | P2 | 1 hour | DLQ > 50; accuracy drop > 3%; Bedrock error rate > 15% |
 | P3 | 4 hours | Queue depth 2k–5k; single-tenant budget > 80% |
 
+---
+
+## 7. Pending SLO Risks — Changes Required Before Production Scale
+
+The current demo deployment meets SLOs on warm paths but will violate them under
+peak load (20 PDFs/s ingestion, 30 QPS queries). Two changes must be applied before
+claiming compliance. They are documented here — not yet implemented — so they are
+tracked, understood, and applied as a deliberate step when moving to production.
+
+---
+
+### Risk 1 — Textract Service Quota (Ingestion P95 < 8s at 20 PDFs/s)
+
+**The problem**
+
+AWS accounts start with a default quota of **1 TPS for `AnalyzeExpense`** (the Textract
+call used for OCR in `src/worker/handler.py:_textract_with_retry`). At peak load of
+20 PDFs/s, 19 of every 20 concurrent worker Lambdas will receive a
+`ThrottlingException` and enter the retry loop:
+
+```
+attempt 1 → ThrottledException → wait 2s
+attempt 2 → ThrottledException → wait 4s
+attempt 3 → ThrottledException → wait 8s → FAILED
+```
+
+A single retry already consumes the entire 8s SLO budget. The invoice never reaches
+extraction; it is marked FAILED.
+
+**Why it is a quota and not a code fix**
+
+Textract's `AnalyzeExpense` runs on shared AWS infrastructure. The 1 TPS default
+protects other tenants on the same capacity pool. AWS provisions dedicated throughput
+only after you formally request it — there is no code change that bypasses this.
+
+**The fix — AWS Console action (takes 1–3 business days)**
+
+```
+AWS Console
+  → Service Quotas
+  → Amazon Textract
+  → "AnalyzeDocument/AnalyzeExpense requests per second"
+  → Request quota increase → target value: 25
+  (25 = 20 peak + 25% safety margin)
+```
+
+**What changes in code after approval**
+
+Nothing. The quota increase is account-level. Once approved, 20 concurrent Textract
+calls will succeed on the first attempt, and the existing retry logic becomes a genuine
+safety net for transient errors rather than a constant bottleneck.
+
+**Verification**
+
+After approval, run the load test in `scripts/load_test.py` at 20 users and confirm
+`ProcessingDurationMs` P95 < 8000ms in the CloudWatch dashboard.
+
+---
+
+### Risk 2 — Lambda Cold Starts (Ingestion P95 < 8s + Query P95 < 400ms)
+
+**The problem**
+
+Lambda containers are created on demand when no warm container is available. For the
+worker Lambda, a cold start adds **1.5–2.5s** due to Python runtime initialisation and
+the import of heavy libraries (`boto3`, `fitz`/PyMuPDF). For the review Lambda it adds
+**1–2s**.
+
+At a burst of 20 simultaneous uploads, Lambda may spin up 15–20 new containers at
+once. Each of those invoices loses 2s before doing any real work — pushing them over
+the 8s ingestion SLO. For the review/query Lambda, a single cold start on an idle
+period pushes a structured query over the 400ms SLO.
+
+**Why it cannot be fixed in application code**
+
+Cold start duration is determined by runtime initialisation time, not by what the
+function does. The only way to eliminate cold starts is to keep containers pre-warmed.
+
+**The fix — Provisioned Concurrency in `terraform/lambda.tf`**
+
+Add the following to both Lambda resources:
+
+```hcl
+# Worker Lambda — keeps 20 warm containers ready for peak ingestion
+resource "aws_lambda_provisioned_concurrency_config" "worker" {
+  function_name                  = aws_lambda_function.worker.function_name
+  qualifier                      = aws_lambda_function.worker.version
+  provisioned_concurrent_executions = 20
+}
+
+# Review Lambda — keeps 5 warm containers ready for query SLO
+resource "aws_lambda_provisioned_concurrency_config" "review" {
+  function_name                  = aws_lambda_function.review.function_name
+  qualifier                      = aws_lambda_function.review.version
+  provisioned_concurrent_executions = 5
+}
+```
+
+Note: provisioned concurrency requires a published Lambda version (not `$LATEST`).
+The Lambda resources in `terraform/lambda.tf` need `publish = true` added before
+applying this config.
+
+**Cost impact**
+
+| Resource | Provisioned | Monthly cost (approx.) |
+|---|---|---|
+| Worker Lambda (512 MB × 20) | 20 warm | ~$28/month |
+| Review Lambda (256 MB × 5) | 5 warm | ~$4/month |
+| **Total** | | **~$32/month** |
+
+This is a fixed cost regardless of traffic, in exchange for eliminating latency spikes
+at burst. It is well within the $18k/month AI budget constraint.
+
+**Verification**
+
+After `terraform apply`, invoke both Lambdas and confirm zero cold starts in
+CloudWatch Logs Insights:
+
+```sql
+filter @message like /Init Duration/
+| stats count() as cold_starts by bin(5m)
+```
+
+Zero results = all invocations are hitting warm containers.
+
 PagerDuty escalation policy: primary on-call → secondary → engineering manager (if no ack within 2× response time).
