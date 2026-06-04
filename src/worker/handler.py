@@ -99,6 +99,7 @@ def _process(body: dict):
     if not classification["is_invoice"] or classification["confidence"] < CLASSIFY_THRESHOLD:
         _log(invoice_id, "rejected", **classification)
         _update_status(invoice_id, "REJECTED", is_invoice=False)
+        _delete_s3_object(s3_bucket, s3_key)
         _emit("InvoicesRejected", 1)
         return  # stop here — not a real invoice
 
@@ -360,6 +361,13 @@ def _mark_failed(invoice_id: str, bucket: str, key: str, reason: str):
     _update_status(invoice_id, "FAILED")
     _emit("InvoicesFailed", 1)
     # Do NOT raise — SQS must not retry; we already exhausted our own retries
+
+
+def _delete_s3_object(bucket: str, key: str):
+    try:
+        s3.delete_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        _log("s3", "delete_error", bucket=bucket, key=key, error=str(exc))
 
 
 # ── CloudWatch metrics ─────────────────────────────────────────────────────────
