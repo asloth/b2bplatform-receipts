@@ -1,0 +1,54 @@
+This exercise is designed to assess your strategic thinking, architectural knowledge, and
+problem-solving skills in a real-world scenario.
+While this challenge does not require you to write any code, we encourage you to
+leverage your experience with modern backend technologies, cloud platforms
+(especially AWS), and AI integration frameworks like LangChain, as well as any
+development tools or methodologies you typically employ.
+Feel free to explore and propose innovative solutions within the given constraints. Your
+ability to articulate complex technical designs, justify your decisions, and anticipate
+operational challenges will be key to your success.
+
+Business Context
+A B2B platform wants to enable its clients to upload invoices in PDF format (both
+supplier and customer). The system should extract and validate key fields, register the
+information into an operational database, and enable a conversational interface to query
+any invoice (by supplier, date, project, taxes, discrepancies, etc.). The platform should
+integrate with an external ERP (e.g., NetSuite / SAP) for reconciliation of documents and
+payment statuses.
+
+Scope
+● Ingestion: Web + API for PDF upload with minimal metadata.
+● Extraction: OCR + LLM/IE for key fields (supplier, ID, date, amounts, taxes).
+● Validation: hard business rules, confidence scores, and human-in-the-loop if
+confidence is low.
+● Persistence: multi-tenant relational DB + PDF storage + provenance.
+● Query: structured APIs + conversational interface (RAG + SQL generation).
+● ERP Integration: webhooks and batch jobs.
+● Audit: tenant logs, change trails, exportable reports.
+
+Assumptions and Constraints
+● Load: 150k PDFs/month; peaks of 20 PDFs/s ingestion, 30 QPS for queries.
+● SLOs: ingestion+extraction P95 < 8s; structured query P95 < 400ms;
+conversational query P95 < 2.5s.
+● AI Budget: ≤ USD 18k/month.
+● Accuracy targets: ≥ 98% (totals/dates), ≥ 96% (taxes/currency), ≥ 95% (supplier
+ID).
+● Multi-country: diverse tax schemes and currencies.
+● Security/compliance: multi-tenant, encryption, PII redaction, regional data
+residency.
+● AI provider instability: assume 20% rate limits/timeouts during peak.
+
+Deliverables (NO CODING REQUIRED)
+1) System Design Document (max. 10 pages)
+● Architecture with diagrams (C4 + sequence flows).
+● Key decisions and trade-offs
+● Data model and provenance.
+● Reliability and cost estimates.
+● Security and compliance approach.
+● Observability strategy.
+2) API Specifications (max. 3 pages, JSON examples)
+● /invoices/upload, /invoices/{id}, /invoices/search, /assist/query, ERP webhooks.
+3) AI/IE & Evaluation Plan (max. 3 pages)
+● Extraction, validation, conversational layer, quality metrics.
+4) MLOps & Operations (max. 2 pages)
+● Versioning, drift detection, backpressure handling, cost controls.

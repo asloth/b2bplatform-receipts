@@ -1,0 +1,12 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — safe to put account-specific values here.
+
+aws_region     = "us-east-1"    # region where everything deploys
+bedrock_region = "us-east-1"    # must support Claude Haiku (us-east-1, us-west-2, eu-west-1)
+project_prefix = "b2bplatform"
+environment    = "demo"
+
+# To switch to the client's AWS account:
+# 1. Change aws_region and bedrock_region to their region
+# 2. Set AWS_PROFILE or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY for their account
+# 3. terraform init && terraform apply
