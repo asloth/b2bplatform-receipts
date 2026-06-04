@@ -5,10 +5,13 @@ import {
   CheckCircle2,
   RefreshCw,
   ChevronRight,
-  X,
   Loader2,
   ClipboardCheck,
   Inbox,
+  FileText,
+  X,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -17,7 +20,8 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { Progress } from '@/components/ui/progress'
+import { Dialog, DialogContent } from '@/components/ui/dialog'
 import {
   Table,
   TableBody,
@@ -26,7 +30,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { listReviewTasks, getReviewTask, resolveReviewTask } from '@/api/client'
+import { listReviewTasks, getReviewTask, resolveReviewTask, getInvoicePreview } from '@/api/client'
 import type { ReviewTask, ReviewTaskDetail } from '@/types'
 import { cn } from '@/lib/utils'
 
@@ -40,18 +44,32 @@ const FIELD_LABELS: Record<string, string> = {
   currency: 'Currency',
 }
 
-function ConfidenceBadge({ value }: { value: number }) {
+const FIELD_PLACEHOLDERS: Record<string, string> = {
+  supplier_name: 'e.g. Acme Corp',
+  invoice_number: 'e.g. INV-2024-001',
+  invoice_date: 'e.g. 2024-01-15',
+  total_amount: 'e.g. 1200.00',
+  tax_amount: 'e.g. 120.00',
+  subtotal: 'e.g. 1080.00',
+  currency: 'e.g. USD',
+}
+
+function ConfidenceBar({ value }: { value: number }) {
   const pct = Math.round(value * 100)
-  const cls =
-    pct >= 85
-      ? 'bg-green-50 text-green-700 border-green-200'
-      : pct >= 70
-        ? 'bg-amber-50 text-amber-700 border-amber-200'
-        : 'bg-red-50 text-red-700 border-red-200'
+  const color =
+    pct >= 85 ? 'bg-green-500' : pct >= 50 ? 'bg-amber-500' : 'bg-red-500'
+  const label =
+    pct >= 85 ? 'text-green-700' : pct >= 50 ? 'text-amber-700' : 'text-red-600'
+
   return (
-    <span className={cn('inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium', cls)}>
-      {pct}%
-    </span>
+    <div className="flex items-center gap-2 min-w-[110px]">
+      <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+        <div className={cn('h-full rounded-full transition-all', color)} style={{ width: `${pct}%` }} />
+      </div>
+      <span className={cn('text-xs font-semibold tabular-nums w-8 text-right', label)}>
+        {pct}%
+      </span>
+    </div>
   )
 }
 
@@ -72,12 +90,16 @@ export default function Review() {
   const [tasks, setTasks] = useState<ReviewTask[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+
+  const [open, setOpen] = useState(false)
   const [detail, setDetail] = useState<ReviewTaskDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
   const [corrections, setCorrections] = useState<Record<string, string>>({})
   const [notes, setNotes] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [pdfZoom, setPdfZoom] = useState(100)
 
   const fetchTasks = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
@@ -99,30 +121,43 @@ export default function Review() {
     return () => clearInterval(interval)
   }, [fetchTasks])
 
-  const openTask = async (taskId: string) => {
-    setSelectedTaskId(taskId)
+  const openTask = async (task: ReviewTask) => {
+    setOpen(true)
     setDetail(null)
+    setPreviewUrl(null)
     setCorrections({})
     setNotes('')
+    setPdfZoom(100)
     setDetailLoading(true)
-    try {
-      const d = await getReviewTask(taskId)
-      setDetail(d)
+    setPreviewLoading(true)
+
+    // fetch detail + preview in parallel
+    const [detailRes, previewRes] = await Promise.allSettled([
+      getReviewTask(task.task_id),
+      getInvoicePreview(task.invoice_id),
+    ])
+
+    if (detailRes.status === 'fulfilled') {
+      setDetail(detailRes.value)
       const initial: Record<string, string> = {}
-      for (const f of d.fields) {
+      for (const f of detailRes.value.fields) {
         initial[f.field_name] = f.normalised_value ?? ''
       }
       setCorrections(initial)
-    } catch {
+    } else {
       toast.error('Could not load task details')
-      setSelectedTaskId(null)
-    } finally {
-      setDetailLoading(false)
+      setOpen(false)
     }
+    setDetailLoading(false)
+
+    if (previewRes.status === 'fulfilled') {
+      setPreviewUrl(previewRes.value.url)
+    }
+    setPreviewLoading(false)
   }
 
   const handleSubmit = async () => {
-    if (!selectedTaskId || !detail) return
+    if (!detail) return
     setSubmitting(true)
 
     const changed: Record<string, string> = {}
@@ -133,11 +168,10 @@ export default function Review() {
     }
 
     try {
-      await resolveReviewTask(selectedTaskId, changed, notes)
-      toast.success('Task resolved — invoice validated')
-      setSelectedTaskId(null)
-      setDetail(null)
-      setTasks((prev) => prev.filter((t) => t.task_id !== selectedTaskId))
+      await resolveReviewTask(detail.task_id, changed, notes)
+      toast.success('Invoice validated successfully')
+      setOpen(false)
+      setTasks((prev) => prev.filter((t) => t.task_id !== detail.task_id))
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Submit failed')
     } finally {
@@ -145,31 +179,26 @@ export default function Review() {
     }
   }
 
-  const lowFields = detail
-    ? detail.fields.filter((f) => f.confidence < 0.85)
-    : []
+  const flaggedFields = detail?.fields.filter((f) => f.confidence < 0.85) ?? []
+  const goodFields = detail?.fields.filter((f) => f.confidence >= 0.85) ?? []
 
   return (
     <div className="space-y-6">
+      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Review Queue</h1>
           <p className="text-muted-foreground mt-1">
-            Invoices where AI confidence is below 85% — review and correct extracted fields.
+            Invoices where AI confidence is below 85% — view the document and correct flagged fields.
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => fetchTasks(true)}
-          disabled={refreshing}
-        >
+        <Button variant="outline" size="sm" onClick={() => fetchTasks(true)} disabled={refreshing}>
           <RefreshCw className={cn('h-4 w-4 mr-2', refreshing && 'animate-spin')} />
           Refresh
         </Button>
       </div>
 
-      {/* Stats bar */}
+      {/* Stats */}
       {!loading && (
         <div className="flex gap-4">
           <Card className="flex-1">
@@ -191,11 +220,8 @@ export default function Review() {
               <div>
                 <p className="text-2xl font-bold">
                   {tasks.length > 0
-                    ? Math.round(
-                        tasks.reduce((s, t) => s + t.doc_confidence, 0) / tasks.length * 100,
-                      )
+                    ? `${Math.round(tasks.reduce((s, t) => s + t.doc_confidence, 0) / tasks.length * 100)}%`
                     : '—'}
-                  {tasks.length > 0 && <span className="text-base font-normal">%</span>}
                 </p>
                 <p className="text-xs text-muted-foreground">Avg Confidence</p>
               </div>
@@ -212,9 +238,7 @@ export default function Review() {
         <CardContent className="p-0">
           {loading ? (
             <div className="p-6 space-y-3">
-              {[1, 2, 3].map((i) => (
-                <Skeleton key={i} className="h-12 w-full" />
-              ))}
+              {[1, 2, 3].map((i) => <Skeleton key={i} className="h-12 w-full" />)}
             </div>
           ) : tasks.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16 text-center">
@@ -222,16 +246,14 @@ export default function Review() {
                 <Inbox className="h-6 w-6 text-muted-foreground" />
               </div>
               <p className="font-medium">All clear</p>
-              <p className="text-sm text-muted-foreground mt-1">
-                No invoices pending review right now.
-              </p>
+              <p className="text-sm text-muted-foreground mt-1">No invoices pending review right now.</p>
             </div>
           ) : (
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>Invoice ID</TableHead>
-                  <TableHead>Confidence</TableHead>
+                  <TableHead>Doc Confidence</TableHead>
                   <TableHead>Flagged Fields</TableHead>
                   <TableHead>Submitted</TableHead>
                   <TableHead className="w-[80px]" />
@@ -240,17 +262,18 @@ export default function Review() {
               <TableBody>
                 {tasks.map((task) => {
                   const flagged = Object.keys(task.low_confidence_fields)
+                  const docPct = Math.round(task.doc_confidence * 100)
                   return (
                     <TableRow
                       key={task.task_id}
                       className="cursor-pointer hover:bg-muted/40"
-                      onClick={() => openTask(task.task_id)}
+                      onClick={() => openTask(task)}
                     >
-                      <TableCell className="font-mono text-sm">
-                        {shortId(task.invoice_id)}
-                      </TableCell>
+                      <TableCell className="font-mono text-sm">{shortId(task.invoice_id)}</TableCell>
                       <TableCell>
-                        <ConfidenceBadge value={task.doc_confidence} />
+                        <div className="flex items-center gap-2">
+                          <ConfidenceBar value={task.doc_confidence} />
+                        </div>
                       </TableCell>
                       <TableCell>
                         <div className="flex flex-wrap gap-1">
@@ -260,9 +283,10 @@ export default function Review() {
                             </Badge>
                           ))}
                           {flagged.length > 3 && (
-                            <Badge variant="secondary" className="text-xs">
-                              +{flagged.length - 3}
-                            </Badge>
+                            <Badge variant="secondary" className="text-xs">+{flagged.length - 3}</Badge>
+                          )}
+                          {flagged.length === 0 && (
+                            <span className="text-xs text-muted-foreground">None</span>
                           )}
                         </div>
                       </TableCell>
@@ -271,8 +295,7 @@ export default function Review() {
                       </TableCell>
                       <TableCell>
                         <Button variant="ghost" size="sm" className="h-8">
-                          Review
-                          <ChevronRight className="ml-1 h-4 w-4" />
+                          Review <ChevronRight className="ml-1 h-4 w-4" />
                         </Button>
                       </TableCell>
                     </TableRow>
@@ -284,134 +307,193 @@ export default function Review() {
         </CardContent>
       </Card>
 
-      {/* Review slide-over sheet */}
-      <Sheet open={!!selectedTaskId} onOpenChange={(open) => !open && setSelectedTaskId(null)}>
-        <SheetContent className="w-full sm:max-w-2xl overflow-y-auto">
-          <SheetHeader className="mb-6">
-            <div className="flex items-start justify-between gap-4">
+      {/* Full-screen review dialog */}
+      <Dialog open={open} onOpenChange={(v) => !submitting && setOpen(v)}>
+        <DialogContent className="max-w-[95vw] w-[95vw] h-[92vh] p-0 gap-0 overflow-hidden">
+          {/* Dialog header */}
+          <div className="flex items-center justify-between px-6 py-4 border-b shrink-0">
+            <div className="flex items-center gap-3">
+              <FileText className="h-5 w-5 text-muted-foreground" />
               <div>
-                <SheetTitle>Review Invoice</SheetTitle>
+                <h2 className="font-semibold text-base">Review Invoice</h2>
                 {detail && (
-                  <p className="text-sm text-muted-foreground mt-1 font-mono">
-                    {detail.invoice_id}
-                  </p>
+                  <p className="text-xs text-muted-foreground font-mono mt-0.5">{detail.invoice_id}</p>
                 )}
               </div>
               {detail && (
-                <ConfidenceBadge value={detail.doc_confidence} />
-              )}
-            </div>
-          </SheetHeader>
-
-          {detailLoading ? (
-            <div className="space-y-4">
-              {[1, 2, 3, 4].map((i) => (
-                <Skeleton key={i} className="h-16 w-full" />
-              ))}
-            </div>
-          ) : detail ? (
-            <div className="space-y-6">
-              {/* Low confidence callout */}
-              {lowFields.length > 0 && (
-                <div className="flex gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3">
-                  <AlertTriangle className="h-4 w-4 text-amber-600 mt-0.5 shrink-0" />
-                  <div className="text-sm text-amber-700">
-                    <p className="font-medium">
-                      {lowFields.length} field{lowFields.length > 1 ? 's' : ''} need attention
-                    </p>
-                    <p className="text-xs mt-0.5 opacity-80">
-                      Review and correct the highlighted fields below before submitting.
-                    </p>
-                  </div>
+                <div className="ml-2">
+                  <ConfidenceBar value={detail.doc_confidence} />
                 </div>
               )}
+            </div>
+            <Button variant="ghost" size="icon" onClick={() => setOpen(false)} disabled={submitting}>
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
 
-              {/* Fields */}
-              <div className="space-y-3">
-                <p className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
-                  Extracted Fields
-                </p>
-                {detail.fields.map((field) => {
-                  const isLow = field.confidence < 0.85
-                  return (
-                    <div
-                      key={field.field_name}
-                      className={cn(
-                        'rounded-lg border p-3 space-y-2 transition-colors',
-                        isLow ? 'border-amber-200 bg-amber-50/50' : 'border-border bg-background',
-                      )}
+          {/* Split layout */}
+          <div className="flex flex-1 overflow-hidden min-h-0">
+
+            {/* Left — PDF preview */}
+            <div className="flex-1 bg-muted/30 border-r flex flex-col min-w-0">
+              <div className="flex items-center justify-between px-4 py-2 border-b bg-background/80 shrink-0">
+                <span className="text-sm font-medium text-muted-foreground">Original Document</span>
+                <div className="flex items-center gap-1">
+                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setPdfZoom(z => Math.max(50, z - 25))}>
+                    <ZoomOut className="h-3.5 w-3.5" />
+                  </Button>
+                  <span className="text-xs text-muted-foreground w-10 text-center">{pdfZoom}%</span>
+                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setPdfZoom(z => Math.min(200, z + 25))}>
+                    <ZoomIn className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-auto p-4 flex items-start justify-center">
+                {previewLoading ? (
+                  <div className="flex flex-col items-center justify-center h-full gap-3 text-muted-foreground">
+                    <Loader2 className="h-8 w-8 animate-spin" />
+                    <p className="text-sm">Loading document…</p>
+                  </div>
+                ) : previewUrl ? (
+                  <div style={{ width: `${pdfZoom}%`, minWidth: '300px' }} className="h-full">
+                    <object
+                      data={previewUrl}
+                      type="application/pdf"
+                      className="w-full h-full rounded border shadow-sm"
+                      style={{ minHeight: '600px' }}
                     >
-                      <div className="flex items-center justify-between">
-                        <label className="text-sm font-medium flex items-center gap-2">
-                          {isLow && <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />}
-                          {FIELD_LABELS[field.field_name] ?? field.field_name}
-                        </label>
-                        <ConfidenceBadge value={field.confidence} />
+                      <div className="flex flex-col items-center justify-center h-64 bg-muted rounded border gap-3">
+                        <FileText className="h-10 w-10 text-muted-foreground" />
+                        <p className="text-sm text-muted-foreground">PDF preview not supported in this browser</p>
+                        <a href={previewUrl} target="_blank" rel="noopener noreferrer">
+                          <Button variant="outline" size="sm">Open PDF</Button>
+                        </a>
                       </div>
-                      <Input
-                        value={corrections[field.field_name] ?? ''}
-                        onChange={(e) =>
-                          setCorrections((prev) => ({
-                            ...prev,
-                            [field.field_name]: e.target.value,
-                          }))
-                        }
-                        placeholder="No value extracted"
-                        className={cn(
-                          'text-sm h-8',
-                          isLow && 'border-amber-200 focus-visible:ring-amber-400',
-                        )}
-                      />
-                      {field.raw_value && field.raw_value !== corrections[field.field_name] && (
-                        <p className="text-xs text-muted-foreground">
-                          Original: <span className="font-mono">{field.raw_value}</span>
+                    </object>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center h-full gap-3 text-muted-foreground">
+                    <FileText className="h-10 w-10" />
+                    <p className="text-sm">Could not load preview</p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Right — fields */}
+            <div className="w-[420px] shrink-0 flex flex-col overflow-hidden">
+              {detailLoading ? (
+                <div className="p-6 space-y-4">
+                  {[1, 2, 3, 4].map((i) => <Skeleton key={i} className="h-16 w-full" />)}
+                </div>
+              ) : detail ? (
+                <div className="flex-1 overflow-y-auto p-5 space-y-5">
+
+                  {/* Flagged fields */}
+                  {flaggedFields.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle className="h-4 w-4 text-amber-500" />
+                        <p className="text-sm font-semibold text-amber-700">
+                          {flaggedFields.length} field{flaggedFields.length > 1 ? 's' : ''} need attention
                         </p>
-                      )}
+                      </div>
+
+                      {flaggedFields.map((field) => {
+                        const pct = Math.round(field.confidence * 100)
+                        return (
+                          <div key={field.field_name} className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <label className="text-xs font-semibold text-amber-800 uppercase tracking-wide">
+                                {FIELD_LABELS[field.field_name] ?? field.field_name}
+                              </label>
+                              <ConfidenceBar value={field.confidence} />
+                            </div>
+                            {pct === 0 && (
+                              <p className="text-xs text-red-600 font-medium">
+                                ⚠ Not detected — enter the value from the document
+                              </p>
+                            )}
+                            <Input
+                              value={corrections[field.field_name] ?? ''}
+                              onChange={(e) =>
+                                setCorrections((prev) => ({ ...prev, [field.field_name]: e.target.value }))
+                              }
+                              placeholder={FIELD_PLACEHOLDERS[field.field_name] ?? 'Enter value'}
+                              className="h-8 text-sm border-amber-300 focus-visible:ring-amber-400 bg-white"
+                            />
+                          </div>
+                        )
+                      })}
                     </div>
-                  )
-                })}
-              </div>
-
-              <Separator />
-
-              {/* Resolution notes */}
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Resolution Notes</label>
-                <Textarea
-                  value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
-                  placeholder="Optional notes about corrections made..."
-                  className="resize-none text-sm"
-                  rows={3}
-                />
-              </div>
-
-              {/* Actions */}
-              <div className="flex gap-2 pt-2">
-                <Button
-                  onClick={handleSubmit}
-                  disabled={submitting}
-                  className="flex-1"
-                >
-                  {submitting ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <CheckCircle2 className="mr-2 h-4 w-4" />
                   )}
-                  Submit & Validate
+
+                  {flaggedFields.length > 0 && goodFields.length > 0 && <Separator />}
+
+                  {/* Good fields */}
+                  {goodFields.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="h-4 w-4 text-green-500" />
+                        <p className="text-sm font-semibold text-green-700">
+                          Auto-extracted with high confidence
+                        </p>
+                      </div>
+
+                      {goodFields.map((field) => (
+                        <div key={field.field_name} className="rounded-lg border p-3 space-y-2 bg-background">
+                          <div className="flex items-center justify-between">
+                            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                              {FIELD_LABELS[field.field_name] ?? field.field_name}
+                            </label>
+                            <ConfidenceBar value={field.confidence} />
+                          </div>
+                          <Input
+                            value={corrections[field.field_name] ?? ''}
+                            onChange={(e) =>
+                              setCorrections((prev) => ({ ...prev, [field.field_name]: e.target.value }))
+                            }
+                            placeholder={FIELD_PLACEHOLDERS[field.field_name] ?? 'Enter value'}
+                            className="h-8 text-sm"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <Separator />
+
+                  {/* Resolution notes */}
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Resolution Notes <span className="text-muted-foreground font-normal">(optional)</span></label>
+                    <Textarea
+                      value={notes}
+                      onChange={(e) => setNotes(e.target.value)}
+                      placeholder="Describe any corrections made…"
+                      className="resize-none text-sm"
+                      rows={3}
+                    />
+                  </div>
+                </div>
+              ) : null}
+
+              {/* Footer actions */}
+              <div className="border-t p-4 shrink-0 bg-background flex gap-2">
+                <Button onClick={handleSubmit} disabled={submitting || detailLoading} className="flex-1">
+                  {submitting
+                    ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Saving…</>
+                    : <><CheckCircle2 className="mr-2 h-4 w-4" />Submit & Validate</>
+                  }
                 </Button>
-                <Button
-                  variant="outline"
-                  onClick={() => setSelectedTaskId(null)}
-                  disabled={submitting}
-                >
-                  <X className="h-4 w-4" />
+                <Button variant="outline" onClick={() => setOpen(false)} disabled={submitting}>
+                  Cancel
                 </Button>
               </div>
             </div>
-          ) : null}
-        </SheetContent>
-      </Sheet>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

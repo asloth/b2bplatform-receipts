@@ -9,6 +9,7 @@ import boto3
 s3 = boto3.client("s3")
 sqs = boto3.client("sqs")
 rds = boto3.client("rds-data")
+PRESIGN_EXPIRY = 3600  # 1 hour
 
 S3_BUCKET = os.environ["S3_BUCKET"]
 SQS_QUEUE_URL = os.environ["SQS_QUEUE_URL"]
@@ -21,6 +22,12 @@ MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB
 
 def handler(event, context):
     method = (event.get("requestContext") or {}).get("http", {}).get("method", "POST")
+    path = event.get("rawPath", "")
+
+    if method == "GET" and path.endswith("/preview"):
+        invoice_id = (event.get("pathParameters") or {}).get("invoice_id")
+        return _get_preview(invoice_id)
+
     if method == "GET":
         job_id = (event.get("pathParameters") or {}).get("job_id")
         return _get_status(job_id)
@@ -66,6 +73,31 @@ def handler(event, context):
         "statusCode": 202,
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps({"job_id": invoice_id, "status": "PROCESSING"}),
+    }
+
+
+def _get_preview(invoice_id: str):
+    if not invoice_id:
+        return _error(400, "Missing invoice_id")
+    result = rds.execute_statement(
+        resourceArn=DB_CLUSTER_ARN,
+        secretArn=DB_SECRET_ARN,
+        database=DB_NAME,
+        sql="SELECT s3_key FROM invoices WHERE id = :id::uuid",
+        parameters=[{"name": "id", "value": {"stringValue": invoice_id}}],
+    )
+    if not result["records"]:
+        return _error(404, "Invoice not found")
+    s3_key = result["records"][0][0]["stringValue"]
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": s3_key},
+        ExpiresIn=PRESIGN_EXPIRY,
+    )
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({"url": url, "expires_in": PRESIGN_EXPIRY}),
     }
 
 

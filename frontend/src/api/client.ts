@@ -27,6 +27,10 @@ export async function getReviewTask(taskId: string): Promise<ReviewTaskDetail> {
   return request(`/review/tasks/${taskId}`)
 }
 
+export async function getInvoicePreview(invoiceId: string): Promise<{ url: string }> {
+  return request(`/invoices/${invoiceId}/preview`)
+}
+
 export async function resolveReviewTask(
   taskId: string,
   correctedFields: Record<string, string>,

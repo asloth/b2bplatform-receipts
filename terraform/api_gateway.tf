@@ -38,6 +38,12 @@ resource "aws_apigatewayv2_route" "invoice_status" {
   target    = "integrations/${aws_apigatewayv2_integration.upload.id}"
 }
 
+resource "aws_apigatewayv2_route" "invoice_preview" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "GET /invoices/{invoice_id}/preview"
+  target    = "integrations/${aws_apigatewayv2_integration.upload.id}"
+}
+
 resource "aws_lambda_permission" "api_gateway_upload" {
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"
