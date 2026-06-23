@@ -7,7 +7,16 @@
 
 ## 1. Extraction Pipeline
 
-### 1.1 OCR Stage — AWS Textract
+### 1.1 Document Classification — pre-OCR gate
+
+Before any OCR spend, the rendered first page is classified by a vision model (Claude Haiku) to confirm the document is actually an invoice. This is a deliberately cheap filter placed *ahead* of the expensive Textract call.
+
+- `is_invoice` confidence ≥ 0.70 → continue to OCR (§1.2)
+- `is_invoice` confidence < 0.70 → **REJECTED** (`rejection_reason = NOT_AN_INVOICE`); the PDF is moved to a `quarantine/` S3 prefix with a 30-day lifecycle — recoverable if the classifier was wrong, then auto-expired — and is never OCR'd or persisted as an invoice
+
+**Rationale:** Textract costs ~$0.015/page, so non-invoices (scans of unrelated documents, blank or corrupt pages, accidental or abusive uploads) are filtered before incurring OCR or extraction cost — cheapest filter first. A soft-delete to quarantine (rather than a hard delete) keeps a misclassified real invoice recoverable while still satisfying data-minimisation.
+
+### 1.2 OCR Stage — AWS Textract
 
 Textract `AnalyzeExpense` is the primary OCR entry point. It is purpose-built for financial documents and returns both line-item tables and summary fields with bounding-box coordinates.
 
@@ -20,7 +29,7 @@ S3 PDF → Textract.AnalyzeExpense()
 
 **Post-OCR normalisation:** Textract output is lightly cleaned (remove headers/footers, page numbers, watermarks) before being passed to the LLM. Tables are serialised as Markdown for prompt readability.
 
-### 1.2 LLM Extraction Stage — Claude Haiku (primary)
+### 1.3 LLM Extraction Stage — Claude Haiku (primary)
 
 A structured extraction prompt instructs Claude Haiku to produce a validated JSON object. The prompt uses:
 - **System message**: role assignment + output JSON schema definition + tax-scheme reference table (multi-country VAT, GST, IVA, etc.)
@@ -89,6 +98,8 @@ Field weights by business criticality:
 | < 0.85 | Block → PENDING_REVIEW; Sonnet re-extraction attempted first |
 | < 0.85 after Sonnet | Hard human review required; SLA: 4h for critical invoices |
 
+> Two terminal `REJECTED` outcomes sit **outside** this confidence ladder: `NOT_AN_INVOICE` (pre-OCR classification, §1.1) and `DUPLICATE` (natural-key match, §3). Both move the PDF to quarantine rather than persisting an invoice, so they never reach this routing table.
+
 ---
 
 ## 3. Validation Rules (Hard Business Rules)
@@ -99,9 +110,9 @@ Beyond confidence, the following deterministic rules are applied regardless of L
 |------|-------|-----------------|
 | Math balance | `subtotal + tax ≈ total` (±0.02) | Flag discrepancy, human review |
 | Invoice date range | `invoice_date` not in future; not more than 2 years ago | Flag + alert |
-| Currency vs. tax scheme | EUR invoices from ES/FR/DE must have `tax_rate` ∈ {0.10, 0.21} | Flag for country-specific review |
+| Currency vs. tax scheme | `tax_rate` must be valid for the invoice's country — e.g. ES {0.21, 0.10, 0.04}, FR {0.20, 0.10, 0.055, 0.021}, DE {0.19, 0.07} | Flag for country-specific review |
 | Supplier ID format | Validated against regex per country (NIF, EIN, ABN, GSTIN…) | Low confidence penalty |
-| Duplicate detection | Hash(supplier_id + invoice_number + total_amount) checked against tenant's existing invoices | Reject with `DUPLICATE` status |
+| Duplicate detection | Natural key `Hash(supplier_id + invoice_number + total_amount)` checked against tenant's existing invoices | `REJECTED` (`rejection_reason = DUPLICATE`); PDF moved to quarantine |
 | Required fields | `supplier_name`, `invoice_number`, `invoice_date`, `total_amount` must be non-null | PENDING_REVIEW |
 
 ---
@@ -112,15 +123,17 @@ Beyond confidence, the following deterministic rules are applied regardless of L
 
 ```
 User query
-  → Intent classification (Claude Haiku, ~50ms)
-       ├─ structured_aggregation → SQL generation → Aurora
-       ├─ document_lookup       → Aurora SELECT + return fields
-       └─ open_question         → RAG (OpenSearch k-NN + metadata filter) → Claude Sonnet synthesis
+  → Intent classification (Claude Haiku, ~300ms)
+       ├─ aggregation → SQL generation → Aurora
+       ├─ lookup      → Aurora SELECT + return fields
+       └─ semantic    → RAG (OpenSearch k-NN + metadata filter) → Claude Sonnet synthesis
 ```
+
+> These three intents are returned to the client as the `query_type` field in `/assist/query` (API Spec §5).
 
 ### 4.2 RAG Index
 
-- **Embedding model**: Amazon Titan Text Embeddings V2 (1,536 dimensions)
+- **Embedding model**: Amazon Titan Text Embeddings V2 (1,024 dimensions)
 - **Indexed content**: concatenated extracted fields + summary sentence per invoice
 - **Metadata filters**: `tenant_id`, `invoice_type`, `currency`, `date_range`, `supplier_id` — applied pre-k-NN to avoid cross-tenant leakage
 - **Retrieval**: top-5 invoices by cosine similarity; results reranked by date relevance

@@ -71,14 +71,16 @@ _TOOL = {
     "name": "query_invoices",
     "description": "Execute a read-only SQL SELECT query against the invoice database and return the results.",
     "inputSchema": {
-        "type": "object",
-        "properties": {
-            "sql": {
-                "type": "string",
-                "description": "A valid PostgreSQL SELECT statement.",
-            }
-        },
-        "required": ["sql"],
+        "json": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "A valid PostgreSQL SELECT statement.",
+                }
+            },
+            "required": ["sql"],
+        }
     },
 }
 
@@ -92,8 +94,14 @@ def handler(event, context):
         return _resp(400, {"error": "question is required"})
 
     # Keep last 6 messages (3 turns) for context without bloating the prompt
-    trimmed_history = history[-6:]
-    messages = trimmed_history + [{"role": "user", "content": question}]
+    trimmed_history = [
+        {
+            "role": m["role"],
+            "content": m["content"] if isinstance(m["content"], list) else [{"text": m["content"]}],
+        }
+        for m in history[-6:]
+    ]
+    messages = trimmed_history + [{"role": "user", "content": [{"text": question}]}]
 
     try:
         answer, sql_used, rows = _run_agent(messages)
@@ -122,7 +130,7 @@ def _run_agent(messages: list) -> tuple[str, str | None, list | None]:
 
         if stop_reason == "tool_use":
             # Claude wants to run a query
-            tool_call = next(b for b in msg["content"] if b.get("type") == "toolUse")
+            tool_call = next(b["toolUse"] for b in msg["content"] if "toolUse" in b)
             sql = tool_call["input"]["sql"]
             tool_use_id = tool_call["toolUseId"]
 
@@ -154,7 +162,7 @@ def _run_agent(messages: list) -> tuple[str, str | None, list | None]:
 
         # stop_reason == "end_turn" — Claude has a final answer
         text = next(
-            (b["text"] for b in msg["content"] if b.get("type") == "text"), ""
+            (b["text"] for b in msg["content"] if "text" in b), ""
         )
         return text, sql_used, rows
 

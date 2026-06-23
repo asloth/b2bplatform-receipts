@@ -80,9 +80,9 @@ ScaleInCooldown = 300s
 
 ### 3.2 Bedrock Rate Limit Handling
 
-- ECS workers implement exponential backoff with jitter: base 1s, max 16s, max 3 retries
+- ECS workers implement exponential backoff with jitter: base 1s, max 3 retries (~6s) — matching the Bedrock retry budget in System Design §7
 - Per-tenant token budget enforced at the worker: if a tenant consumes > 20% of hourly Bedrock quota, their queue messages are delayed 30s via SQS visibility timeout extension
-- Circuit breaker (per worker process): if 3 consecutive Bedrock calls fail, worker pauses extraction and routes messages directly to human review queue — **no silent data loss**
+- Circuit breaker (per tenant): if 3 consecutive Bedrock calls fail for a tenant, extraction is paused for that tenant and its messages route directly to the human review queue — **no silent data loss**
 
 ### 3.3 Database Connection Management
 
@@ -110,9 +110,9 @@ Each tenant has a configurable monthly AI budget (stored in `tenants.config`). T
 | Low-confidence → Sonnet re-extraction | Claude Haiku + Sonnet | $0.0027 |
 | Human-reviewed (no Sonnet) | Claude Haiku | $0.0009 |
 | Conversational query (aggregation, SQL) | Claude Haiku | $0.0003 |
-| Conversational query (open RAG synthesis) | Claude Sonnet | $0.0018 |
+| Conversational query (semantic, RAG synthesis) | Claude Sonnet | $0.0018 |
 
-**Haiku-first policy**: Sonnet is only invoked when Haiku confidence < 0.85 or when the conversational query is classified as `open_question`. This keeps the blended average well below $0.002/invoice.
+**Haiku-first policy**: Sonnet is only invoked when Haiku confidence < 0.85 or when the conversational query is classified as `semantic`. This keeps the blended average well below $0.002/invoice.
 
 ### 4.3 CloudWatch Billing Alarms
 
@@ -141,7 +141,7 @@ Each tenant has a configurable monthly AI budget (stored in `tenants.config`). T
 1. Circuit breakers will have already paused extraction workers
 2. Confirm Bedrock health via AWS Status Page + CloudWatch `ThrottlingException` rate
 3. If AWS-side issue: extraction queue accumulates (SQS retention = 4 days); human review SLA clock starts for high-priority invoices
-4. Optionally activate OpenAI fallback (pre-configured LangChain adapter, disabled by default) via SSM flag
+4. Optionally activate the in-region secondary-model fallback (Amazon Nova via the same Bedrock client, disabled by default) via SSM flag — stays within the tenant's region to preserve data residency (System Design §9)
 5. When Bedrock recovers: resume workers; replay backlog at controlled rate (100 messages/min)
 
 ### 5.3 Accuracy Drop Alert
@@ -166,7 +166,7 @@ Each tenant has a configurable monthly AI budget (stored in `tenants.config`). T
 
 ## 7. Pending SLO Risks — Changes Required Before Production Scale
 
-The current demo deployment meets SLOs on warm paths but will violate them under
+The baseline configuration meets SLOs on warm paths but will violate them under
 peak load (20 PDFs/s ingestion, 30 QPS queries). Two changes must be applied before
 claiming compliance. They are documented here — not yet implemented — so they are
 tracked, understood, and applied as a deliberate step when moving to production.
@@ -178,8 +178,8 @@ tracked, understood, and applied as a deliberate step when moving to production.
 **The problem**
 
 AWS accounts start with a default quota of **1 TPS for `AnalyzeExpense`** (the Textract
-call used for OCR in `src/worker/handler.py:_textract_with_retry`). At peak load of
-20 PDFs/s, 19 of every 20 concurrent worker Lambdas will receive a
+call used for OCR in the processing worker). At peak load of
+20 PDFs/s, 19 of every 20 concurrent worker tasks will receive a
 `ThrottlingException` and enter the retry loop:
 
 ```
@@ -216,75 +216,51 @@ safety net for transient errors rather than a constant bottleneck.
 
 **Verification**
 
-After approval, run the load test in `scripts/load_test.py` at 20 users and confirm
+After approval, run a load test at 20 concurrent users and confirm
 `ProcessingDurationMs` P95 < 8000ms in the CloudWatch dashboard.
 
 ---
 
-### Risk 2 — Lambda Cold Starts (Ingestion P95 < 8s + Query P95 < 400ms)
+### Risk 2 — Burst Capacity (Ingestion P95 < 8s + Query P95 < 400ms)
 
 **The problem**
 
-Lambda containers are created on demand when no warm container is available. For the
-worker Lambda, a cold start adds **1.5–2.5s** due to Python runtime initialisation and
-the import of heavy libraries (`boto3`, `fitz`/PyMuPDF). For the review Lambda it adds
-**1–2s**.
+Two compute tiers lose time on a cold burst:
 
-At a burst of 20 simultaneous uploads, Lambda may spin up 15–20 new containers at
-once. Each of those invoices loses 2s before doing any real work — pushing them over
-the 8s ingestion SLO. For the review/query Lambda, a single cold start on an idle
-period pushes a structured query over the 400ms SLO.
+- **Processing Worker (ECS Fargate).** A new Fargate task takes **~30–60s** to provision
+  and pull its image. At a burst of 20 simultaneous uploads against a baseline of 2 tasks,
+  the queue spikes faster than tasks come online — messages sit in SQS for tens of
+  seconds, breaching the 8s ingestion SLO until the fleet catches up.
+- **Query / Review (Lambda).** A cold Lambda adds **1–2s** of runtime + library init; a
+  single cold start on an idle period pushes a structured query past the 400ms SLO.
 
 **Why it cannot be fixed in application code**
 
-Cold start duration is determined by runtime initialisation time, not by what the
-function does. The only way to eliminate cold starts is to keep containers pre-warmed.
+Both are start-up costs — Fargate provisioning and Lambda runtime init — not a function
+of what the code does. The only fix is to keep capacity warm.
 
-**The fix — Provisioned Concurrency in `terraform/lambda.tf`**
+**The fix**
 
-Add the following to both Lambda resources:
-
-```hcl
-# Worker Lambda — keeps 20 warm containers ready for peak ingestion
-resource "aws_lambda_provisioned_concurrency_config" "worker" {
-  function_name                  = aws_lambda_function.worker.function_name
-  qualifier                      = aws_lambda_function.worker.version
-  provisioned_concurrent_executions = 20
-}
-
-# Review Lambda — keeps 5 warm containers ready for query SLO
-resource "aws_lambda_provisioned_concurrency_config" "review" {
-  function_name                  = aws_lambda_function.review.function_name
-  qualifier                      = aws_lambda_function.review.version
-  provisioned_concurrent_executions = 5
-}
-```
-
-Note: provisioned concurrency requires a published Lambda version (not `$LATEST`).
-The Lambda resources in `terraform/lambda.tf` need `publish = true` added before
-applying this config.
+- **Worker:** raise the ECS service **minimum task count** (e.g. min 6 instead of 2) and
+  scale on `ApproximateNumberOfMessagesVisible` with a short 60s scale-out cooldown
+  (ceiling 20 tasks), backed by a Fargate capacity-provider warm pool.
+- **Query / Review Lambda:** enable **provisioned concurrency** (e.g. 5 warm executions)
+  on a published version so the latency-sensitive query path never cold-starts.
 
 **Cost impact**
 
 | Resource | Provisioned | Monthly cost (approx.) |
 |---|---|---|
-| Worker Lambda (512 MB × 20) | 20 warm | ~$28/month |
-| Review Lambda (256 MB × 5) | 5 warm | ~$4/month |
-| **Total** | | **~$32/month** |
+| Min 6 warm Fargate tasks (0.5 vCPU / 1 GB) | always on | ~$130/month |
+| Query/Review Lambda provisioned concurrency (5) | 5 warm | ~$4/month |
+| **Total** | | **~$134/month** |
 
-This is a fixed cost regardless of traffic, in exchange for eliminating latency spikes
-at burst. It is well within the $18k/month AI budget constraint.
+A fixed cost in exchange for absorbing bursts within SLO.
 
 **Verification**
 
-After `terraform apply`, invoke both Lambdas and confirm zero cold starts in
-CloudWatch Logs Insights:
-
-```sql
-filter @message like /Init Duration/
-| stats count() as cold_starts by bin(5m)
-```
-
-Zero results = all invocations are hitting warm containers.
+Run a load test at 20 concurrent users; confirm `ProcessingDurationMs` P95 < 8000ms with
+no sustained `ApproximateAgeOfOldestMessage` spike, and zero Lambda cold starts on the
+query path in CloudWatch Logs Insights.
 
 PagerDuty escalation policy: primary on-call → secondary → engineering manager (if no ack within 2× response time).

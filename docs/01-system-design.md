@@ -22,20 +22,36 @@ This document describes the architecture for a multi-tenant B2B invoice processi
 C4Context
     title System Context — B2B Invoice Platform
 
-    Person(financeUser, "Finance / AP User", "Uploads invoices and queries data via Web or API")
-    Person(reviewer, "Human Reviewer", "Validates low-confidence extractions")
-    System(platform, "Invoice Platform", "Ingests, extracts, validates, stores, and queries invoices")
+    Person(clientUser, "Client / Tenant (external)", "EXTERNAL · client company — uploads invoice PDFs only (no search or chat access)")
+
+    Enterprise_Boundary(b2bOrg, "B2B Platform Organisation (internal)") {
+        Person(financeUser, "Internal Finance / AP User", "INTERNAL · uploads invoices, runs structured search, and asks the conversational assistant")
+        Person(opsReviewer, "Internal Reviewer (Ops)", "INTERNAL · platform back-office — validates low-confidence extractions across tenants")
+        System(platform, "Invoice Platform", "Ingests, extracts, validates, stores, and queries invoices")
+    }
+
     System_Ext(erp, "ERP System (NetSuite / SAP)", "Source of truth for vendor masters, payment status, GL codes")
     System_Ext(bedrock, "AWS Bedrock (Claude)", "LLM inference for extraction and conversational Q&A")
     System_Ext(textract, "AWS Textract", "Managed OCR service")
     System_Ext(idp, "Identity Provider (Cognito)", "Tenant authentication and JWT issuance")
 
-    Rel(financeUser, platform, "Uploads PDFs, searches invoices, asks questions", "HTTPS")
-    Rel(reviewer, platform, "Reviews and approves flagged extractions", "HTTPS")
+    Rel(clientUser, platform, "Uploads invoice PDFs", "HTTPS")
+    Rel(financeUser, platform, "Uploads, searches, asks conversational questions", "HTTPS")
+    Rel(opsReviewer, platform, "Reviews and approves flagged extractions", "HTTPS")
     Rel(platform, erp, "Reconciles invoices, retrieves payment status", "REST / SOAP / Webhooks")
     Rel(platform, bedrock, "Extraction prompts, conversational queries", "HTTPS")
     Rel(platform, textract, "PDF → raw text + layout", "HTTPS")
-    Rel(financeUser, idp, "Authenticates", "OAuth 2.0 / OIDC")
+    Rel(clientUser, idp, "Authenticates", "OAuth 2.0 / OIDC")
+
+    UpdateElementStyle(clientUser, $bgColor="#4f46e5", $fontColor="#ffffff", $borderColor="#3730a3")
+    UpdateElementStyle(financeUser, $bgColor="#0891b2", $fontColor="#ffffff", $borderColor="#0e7490")
+    UpdateElementStyle(opsReviewer, $bgColor="#0d9488", $fontColor="#ffffff", $borderColor="#0f766e")
+    UpdateElementStyle(platform, $bgColor="#1168bd", $fontColor="#ffffff", $borderColor="#0b4884")
+    UpdateElementStyle(erp, $bgColor="#6b7280", $fontColor="#ffffff", $borderColor="#4b5563")
+    UpdateElementStyle(bedrock, $bgColor="#6b7280", $fontColor="#ffffff", $borderColor="#4b5563")
+    UpdateElementStyle(textract, $bgColor="#6b7280", $fontColor="#ffffff", $borderColor="#4b5563")
+    UpdateElementStyle(idp, $bgColor="#6b7280", $fontColor="#ffffff", $borderColor="#4b5563")
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
 ```
 
 ---
@@ -46,47 +62,64 @@ C4Context
 C4Container
     title Container Diagram — B2B Invoice Platform
 
-    Person(user, "Finance User / Reviewer")
+    Person(extUser, "External Client", "Uploads invoice PDFs only")
+    Person(intUser, "Internal User", "Finance (upload · search · chat) and Reviewer (validate flagged)")
 
-    Boundary(edge, "Edge Layer") {
-        Container(waf, "WAF + Shield", "AWS WAF", "Rate limiting, DDoS protection, geo-blocking")
-        Container(apigw, "API Gateway", "AWS API Gateway", "REST API · JWT auth · throttling per tenant")
+    Boundary(api, "API Layer") {
+        Container(apigw, "API Gateway", "AWS API Gateway", "Authenticates (JWT) and rate-limits per tenant")
     }
 
     Boundary(compute, "Compute Layer") {
-        Container(uploadFn, "Upload Lambda", "Python 3.12", "Validates upload, stores PDF to S3, enqueues job")
-        Container(queryFn, "Query Lambda", "Python 3.12", "Structured search and conversational Q&A")
+        Container(uploadFn, "Upload Lambda", "Python", "Validates upload, stores PDF, enqueues job")
+        Container(queryFn, "Query Lambda", "Python", "Structured search and conversational Q&A")
         Container(pipeline, "Processing Worker", "ECS Fargate", "Textract → Claude extraction → validation → persist")
         Container(erpWorker, "ERP Sync Worker", "Lambda", "Webhook sender and batch reconciliation")
     }
 
     Boundary(storage, "Data Layer") {
-        ContainerDb(s3, "PDF Store", "S3", "Raw PDFs (per-tenant prefix) + redacted copies")
-        ContainerDb(aurora, "Operational DB", "Aurora PostgreSQL Serverless v2", "Multi-tenant data · Row-Level Security")
-        ContainerDb(opensearch, "Vector Store", "OpenSearch Serverless", "Invoice embeddings for RAG")
-        ContainerDb(sqs, "Ingestion Queue", "SQS FIFO + DLQ", "Async processing jobs")
-        ContainerDb(reviewQueue, "Review Queue", "SQS", "Human-in-the-loop tasks")
+        ContainerDb(s3, "PDF Store", "S3", "Raw + redacted PDFs, per tenant")
+        ContainerDb(aurora, "Operational DB", "Aurora PostgreSQL", "Invoice data, isolated per tenant")
+        ContainerDb(opensearch, "Search Index", "OpenSearch", "Invoice embeddings for semantic search")
+        ContainerDb(sqs, "Ingestion Queue", "SQS", "Async processing jobs")
+        ContainerDb(reviewQueue, "Review Queue", "SQS", "Human-review tasks")
     }
 
     Boundary(integration, "Integration Layer") {
-        Container(eventbridge, "Event Bus", "EventBridge", "Routes ERP events and scheduled batch jobs")
+        Container(eventbridge, "Event Bus", "EventBridge", "Routes ERP events and scheduled jobs")
     }
 
-    Rel(user, waf, "HTTPS")
-    Rel(waf, apigw, "Filtered traffic")
+    Rel(extUser, apigw, "Upload only", "HTTPS")
+    Rel(intUser, apigw, "Upload, search, chat, review", "HTTPS")
     Rel(apigw, uploadFn, "POST /invoices/upload")
-    Rel(apigw, queryFn, "GET /invoices/* · POST /assist/query")
-    Rel(uploadFn, s3, "PutObject")
-    Rel(uploadFn, sqs, "SendMessage")
+    Rel(apigw, queryFn, "search · /assist/query · review")
+    Rel(uploadFn, s3, "Store PDF")
+    Rel(uploadFn, sqs, "Enqueue job")
     Rel(sqs, pipeline, "Triggers processing")
-    Rel(pipeline, aurora, "INSERT invoice fields")
+    Rel(pipeline, aurora, "Write invoice fields")
     Rel(pipeline, opensearch, "Index embeddings")
     Rel(pipeline, reviewQueue, "Enqueue low-confidence tasks")
-    Rel(queryFn, aurora, "SELECT (RLS enforced)")
-    Rel(queryFn, opensearch, "k-NN vector search")
+    Rel(queryFn, aurora, "Read (tenant-isolated)")
+    Rel(queryFn, opensearch, "Semantic search")
     Rel(eventbridge, erpWorker, "ERP sync triggers")
     Rel(erpWorker, aurora, "Update sync status")
+
+    UpdateElementStyle(extUser, $bgColor="#4f46e5", $fontColor="#ffffff", $borderColor="#3730a3")
+    UpdateElementStyle(intUser, $bgColor="#0891b2", $fontColor="#ffffff", $borderColor="#0e7490")
+    UpdateElementStyle(apigw, $bgColor="#b45309", $fontColor="#ffffff", $borderColor="#92400e")
+    UpdateElementStyle(uploadFn, $bgColor="#1168bd", $fontColor="#ffffff", $borderColor="#0b4884")
+    UpdateElementStyle(queryFn, $bgColor="#1168bd", $fontColor="#ffffff", $borderColor="#0b4884")
+    UpdateElementStyle(pipeline, $bgColor="#1168bd", $fontColor="#ffffff", $borderColor="#0b4884")
+    UpdateElementStyle(erpWorker, $bgColor="#1168bd", $fontColor="#ffffff", $borderColor="#0b4884")
+    UpdateElementStyle(s3, $bgColor="#16a34a", $fontColor="#ffffff", $borderColor="#15803d")
+    UpdateElementStyle(aurora, $bgColor="#16a34a", $fontColor="#ffffff", $borderColor="#15803d")
+    UpdateElementStyle(opensearch, $bgColor="#16a34a", $fontColor="#ffffff", $borderColor="#15803d")
+    UpdateElementStyle(sqs, $bgColor="#16a34a", $fontColor="#ffffff", $borderColor="#15803d")
+    UpdateElementStyle(reviewQueue, $bgColor="#16a34a", $fontColor="#ffffff", $borderColor="#15803d")
+    UpdateElementStyle(eventbridge, $bgColor="#0d9488", $fontColor="#ffffff", $borderColor="#0f766e")
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="2")
 ```
+
+> **Why stop at Container level (no C3/C4)?** The C4 *model* is applied to Container depth only. Each container is a single thin function, so a C3 (component) view would reveal nothing the §4 sequence flows don't already show, and C4 (code) is auto-generated rather than hand-maintained. The most likely future C3 candidate is the Processing Worker, if it grows into separate classifier / OCR / extractor / validator / scorer components.
 
 ---
 
@@ -96,35 +129,54 @@ C4Container
 
 ```mermaid
 sequenceDiagram
+    autonumber
     actor User
+    box rgb(225,236,250) Edge & Compute
     participant APIGW as API Gateway
     participant UploadFn as Upload Lambda
-    participant S3
-    participant SQS as Ingestion Queue
     participant Worker as Processing Worker (ECS)
+    end
+    box rgb(238,238,238) AI Services
     participant Textract as AWS Textract
     participant Bedrock as Bedrock (Claude Haiku)
+    end
+    box rgb(223,246,231) Data Stores
+    participant S3
+    participant SQS as Ingestion Queue
     participant Aurora
+    participant OpenSearch
+    participant ReviewQueue as Review Queue
+    end
 
-    User->>APIGW: POST /invoices/upload (multipart PDF + metadata)
+    User->>APIGW: Upload invoice PDF + metadata
     APIGW->>UploadFn: Authenticated request (JWT)
-    UploadFn->>S3: PutObject (tenant_id/raw/{invoice_id}.pdf)
-    UploadFn->>SQS: SendMessage {invoice_id, tenant_id, s3_key}
+    UploadFn->>S3: Store PDF (per-tenant path)
+    UploadFn->>SQS: Enqueue job {invoice_id, tenant_id}
     UploadFn-->>User: 202 Accepted {job_id}
 
-    SQS->>Worker: ReceiveMessage
-    Worker->>Textract: AnalyzeDocument (S3 URI)
-    Textract-->>Worker: Blocks (text + layout + tables)
-    Worker->>Bedrock: Extraction prompt + raw text
-    Bedrock-->>Worker: Structured JSON {supplier, id, date, amounts, taxes, currency}
-    Worker->>Worker: Validate fields (business rules + confidence scoring)
-    alt confidence >= threshold
-        Worker->>Aurora: INSERT invoice + fields (status=EXTRACTED)
-        Worker->>Bedrock: Generate embeddings (Titan)
-        Worker->>OpenSearch: Index invoice embedding
-    else confidence < threshold
-        Worker->>Aurora: INSERT invoice (status=PENDING_REVIEW)
-        Worker->>ReviewQueue: Enqueue review task
+    SQS->>Worker: Pick up job
+    Worker->>Bedrock: Classify rendered page — is this an invoice?
+    Bedrock-->>Worker: {is_invoice, confidence}
+    alt not an invoice (low classification confidence)
+        Worker->>S3: Move PDF to quarantine/ (30-day lifecycle)
+        Worker->>Aurora: status=REJECTED (rejection_reason=NOT_AN_INVOICE)
+    else is an invoice
+        Worker->>Textract: Extract text + tables from PDF
+        Textract-->>Worker: Text + layout + tables
+        Worker->>Bedrock: Extract fields from text
+        Bedrock-->>Worker: Fields JSON {supplier, id, date, amounts, taxes, currency}
+        Worker->>Worker: Validate fields + dedupe (natural key) + score confidence
+        alt duplicate (natural-key match in tenant)
+            Worker->>S3: Move PDF to quarantine/ (30-day lifecycle)
+            Worker->>Aurora: status=REJECTED (rejection_reason=DUPLICATE)
+        else confidence >= threshold
+            Worker->>Aurora: Save invoice + fields (status=EXTRACTED)
+            Worker->>Bedrock: Generate embeddings
+            Worker->>OpenSearch: Add to search index
+        else confidence < threshold
+            Worker->>Aurora: Save invoice (status=PENDING_REVIEW)
+            Worker->>ReviewQueue: Enqueue review task
+        end
     end
 ```
 
@@ -132,22 +184,28 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
+    autonumber
     actor Reviewer
+    box rgb(225,236,250) Edge & Compute
     participant APIGW as API Gateway
     participant QueryFn as Query Lambda
+    end
+    box rgb(223,246,231) Data Stores
     participant Aurora
+    participant OpenSearch
     participant SQS as Review Queue
+    end
 
-    SQS->>Reviewer: Notification (email / Slack webhook)
-    Reviewer->>APIGW: GET /invoices/{id}?include=raw_fields
+    SQS->>Reviewer: Notification (email / Slack)
+    Reviewer->>APIGW: Open invoice for review (with raw fields)
     APIGW->>QueryFn: Authenticated request
-    QueryFn->>Aurora: SELECT invoice + fields WHERE id = ?
-    Aurora-->>QueryFn: Invoice record with low-confidence fields highlighted
+    QueryFn->>Aurora: Read invoice + fields
+    Aurora-->>QueryFn: Invoice with low-confidence fields highlighted
     QueryFn-->>Reviewer: Invoice detail with confidence scores
 
-    Reviewer->>APIGW: PATCH /invoices/{id}/fields (corrected values)
-    QueryFn->>Aurora: UPDATE fields + status=VALIDATED + audit_log entry
-    QueryFn->>OpenSearch: Re-index corrected embedding
+    Reviewer->>APIGW: Submit corrected values
+    QueryFn->>Aurora: Save corrections, status=VALIDATED, write audit log
+    QueryFn->>OpenSearch: Re-index corrected invoice
     QueryFn-->>Reviewer: 200 OK
 ```
 
@@ -155,44 +213,66 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    actor User
+    autonumber
+    actor User as Internal Finance User
+    box rgb(225,236,250) Edge & Compute
     participant APIGW as API Gateway
     participant QueryFn as Query Lambda
+    end
+    box rgb(238,238,238) AI Services
+    participant Bedrock as Bedrock (Claude Sonnet)
+    end
+    box rgb(223,246,231) Data Stores
     participant OpenSearch
     participant Aurora
-    participant Bedrock as Bedrock (Claude Sonnet)
+    end
 
-    User->>APIGW: POST /assist/query {"q": "Total VAT paid to Supplier X in Q1?"}
+    User->>APIGW: Ask question ("Total VAT paid to Supplier X in Q1?")
     APIGW->>QueryFn: Authenticated request
-    QueryFn->>Bedrock: Intent classification + embedding of query
-    Bedrock-->>QueryFn: {intent: structured_query, entities: {supplier, period, field: tax}}
-    QueryFn->>Aurora: SELECT SUM(tax_amount) WHERE supplier_id = ? AND date BETWEEN ?
-    Aurora-->>QueryFn: Result set
-    QueryFn->>Bedrock: Compose natural language answer from SQL result
+    QueryFn->>Bedrock: Classify intent (+ embed question)
+    Bedrock-->>QueryFn: {intent, entities: supplier, period, field}
+    alt structured / aggregation intent
+        QueryFn->>Aurora: Sum tax for supplier + period (tenant-isolated)
+        Aurora-->>QueryFn: Result
+    else semantic / discrepancy intent
+        QueryFn->>OpenSearch: Semantic search (tenant-filtered)
+        OpenSearch-->>QueryFn: Best-matching invoices
+        QueryFn->>Aurora: Fetch matched invoice fields (tenant-isolated)
+        Aurora-->>QueryFn: Field details
+    end
+    QueryFn->>Bedrock: Compose answer from results
     Bedrock-->>QueryFn: "Supplier X was paid USD 42,380 in VAT during Q1 2026."
-    QueryFn-->>User: {"answer": "...", "sources": [{invoice_id, amount}]}
+    QueryFn-->>User: {answer, sources}
 ```
 
 ### 4.4 ERP Reconciliation
 
 ```mermaid
 sequenceDiagram
+    autonumber
+    box rgb(225,236,250) Platform
     participant EventBridge
     participant ERPWorker as ERP Sync Worker (Lambda)
+    participant APIGW as API Gateway
+    end
+    box rgb(238,238,238) External ERP
     participant NetSuite as ERP (NetSuite / SAP)
+    end
+    box rgb(223,246,231) Data Stores
     participant Aurora
+    end
 
-    EventBridge->>ERPWorker: Scheduled trigger (every 15 min) OR invoice.validated event
-    ERPWorker->>Aurora: SELECT invoices WHERE erp_sync_status = PENDING
-    ERPWorker->>NetSuite: POST /invoices (REST / SuiteScript)
+    EventBridge->>ERPWorker: Scheduled trigger (every 15 min) OR invoice finalised
+    ERPWorker->>Aurora: Find invoices needing sync
+    ERPWorker->>NetSuite: Push invoice (REST API)
     NetSuite-->>ERPWorker: {erp_id, payment_status}
-    ERPWorker->>Aurora: UPDATE erp_sync_status = SYNCED, erp_id, payment_status
-    ERPWorker->>Aurora: INSERT audit_log {action: ERP_SYNC, result}
+    ERPWorker->>Aurora: Save sync result (erp_id, payment_status)
+    ERPWorker->>Aurora: Write audit log (ERP_SYNC)
 
     Note over NetSuite, ERPWorker: Inbound webhook: payment posted
-    NetSuite->>APIGW: POST /erp/webhook {erp_id, event: PAYMENT_POSTED}
-    APIGW->>ERPWorker: Verify HMAC signature
-    ERPWorker->>Aurora: UPDATE invoice payment_status = PAID
+    NetSuite->>APIGW: Payment posted webhook {erp_id, event}
+    APIGW->>ERPWorker: Verify webhook signature
+    ERPWorker->>Aurora: Save payment_status = PAID
 ```
 
 ---
@@ -217,10 +297,14 @@ CREATE TABLE invoices (
     tenant_id       UUID NOT NULL REFERENCES tenants(id),
     invoice_type    TEXT NOT NULL CHECK (invoice_type IN ('SUPPLIER', 'CUSTOMER')),
     status          TEXT NOT NULL DEFAULT 'PROCESSING',
-    -- PROCESSING → PENDING_REVIEW → VALIDATED → ERP_SYNCED
+    -- PROCESSING → {REJECTED (terminal) | EXTRACTED (auto) | PENDING_REVIEW → VALIDATED}; FAILED on pipeline error
+    rejection_reason TEXT,               -- NOT_AN_INVOICE | DUPLICATE (set only when status=REJECTED)
     confidence_doc  NUMERIC(5,4),        -- overall document confidence score
     s3_key_raw      TEXT NOT NULL,
     s3_key_redacted TEXT,
+    erp_sync_status TEXT DEFAULT 'PENDING',  -- PENDING → SYNCED → FAILED (current state; attempts logged in erp_sync_jobs)
+    payment_status  TEXT,                    -- mirrored from ERP: UNPAID / PARTIAL / PAID
+    erp_id          TEXT,                    -- external ERP record id once synced
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
@@ -298,15 +382,17 @@ CREATE INDEX idx_audit_tenant_invoice     ON audit_logs(tenant_id, invoice_id, c
 
 ## 6. Key Decisions and Trade-offs
 
-| Decision | Choice | Rationale | Trade-off |
-|----------|--------|-----------|-----------|
-| Ingestion pattern | Async (SQS + ECS) | Decouples upload from processing; absorbs 20 PDF/s bursts; 202 response keeps P95 < 8s | Status polling / webhook adds client complexity |
-| OCR engine | AWS Textract | Managed, handles tables/forms natively; AnalyzeExpense purpose-built for invoices | Higher per-page cost than open-source (Tesseract); vendor lock-in |
-| LLM routing | Claude Haiku (primary) → Sonnet (fallback/review) | Haiku: low latency + cost for extraction; Sonnet: accuracy on complex/flagged docs | Two model versions to maintain |
-| Multi-tenant isolation | RLS + per-tenant S3 prefix | Row-Level Security at DB layer is the strongest isolation without schema-per-tenant cost | RLS must be set in every DB session; more complex connection pool setup |
-| Vector store | OpenSearch Serverless | Native AWS, no cluster management, integrates with IAM; sufficient for 150k/month | Less mature than Pinecone/Weaviate for hybrid search; no serverless cold-start issue at this scale |
-| ERP integration | EventBridge + Lambda webhooks + batch fallback | Resilient: if ERP is unavailable, batch job catches up; EventBridge decouples routing | Eventual consistency — invoice status may lag ERP by up to 15 min |
-| Data residency | Per-region CDK stack + Route 53 latency routing | Supports EU, US, APAC without code changes | More operational overhead; cross-region reporting requires careful design |
+Each decision below is tied to the specific requirement, SLO, budget line, or compliance rule that forced it — and names the alternative we rejected and why.
+
+| Decision | Choice | Why (concrete driver) | Rejected alternative | Trade-off |
+|----------|--------|-----------------------|----------------------|-----------|
+| Ingestion pattern | Async (SQS + ECS) | Peak 20 PDF/s × ~4s extraction would hold sync HTTP connections and breach the P95 < 8s SLO under burst; a 202 + queue absorbs spikes and lets ECS scale on queue depth | Synchronous extraction in the request path — simpler, but cold starts + Textract latency miss the SLO at peak | Clients must poll or accept a webhook for final status |
+| OCR engine | AWS Textract (AnalyzeExpense) | Invoice-tuned table/form extraction reaches the ≥ 98% totals / ≥ 96% tax accuracy targets out of the box; fully managed = no OCR infra to run | Tesseract / open-source OCR — cheaper per page but ~85% on tabular layouts; can't meet accuracy SLOs without heavy custom training | Higher per-page cost (~$0.015) and AWS lock-in |
+| LLM routing | Claude Haiku (primary) → Sonnet (fallback/review) | 150k docs/mo under an $18k cap makes per-doc cost dominant; Haiku keeps extraction ~$0.001/doc and meets latency, with Sonnet reserved for the ~10% complex/flagged docs needing higher accuracy | Sonnet for every doc — meets accuracy but ~12× cost blows the budget; Haiku-only — cheap but misses the accuracy SLO on hard layouts | Two model versions + a confidence-routing threshold to maintain |
+| Multi-tenant isolation | RLS + per-tenant S3 prefix | Compliance requires hard tenant isolation; DB-enforced Row-Level Security holds even if app code has a bug, without the cost of a schema/DB per tenant at this scale | Schema-per-tenant — stronger isolation but heavy migrations × N tenants; app-layer filtering only — one missing `WHERE` clause leaks data | RLS must be set (`SET LOCAL app.current_tenant`) in every DB session; more complex connection pooling |
+| Vector store | OpenSearch Serverless | The RAG/semantic-query layer needs k-NN; Serverless is native AWS, IAM-integrated, and has no cluster to manage at 150k docs/mo | Pinecone/Weaviate — stronger hybrid search but adds a third-party vendor, separate auth, and a data-residency review; self-managed OpenSearch — node ops not justified at this scale | Minimum OCU billing applies even at low volume; less mature hybrid search than dedicated vendors |
+| ERP integration | EventBridge + Lambda webhooks + batch fallback | ERPs are slow/unreliable; event-driven sync gives low latency while a scheduled batch reconciles anything missed, so a NetSuite/SAP outage never drops an invoice | Synchronous ERP call in the pipeline — couples the extraction SLO to ERP uptime; batch-only — simpler but stale on every invoice | Eventual consistency — invoice/ERP status can lag up to ~15 min |
+| Data residency | Per-region stack + Route 53 latency routing | GDPR/regional residency requires EU data to stay in-region; per-region stacks keep storage + inference local and route users to their region with no code change | Single global region — simplest but violates EU residency; region-tagging in one shared DB — data still physically co-located, fails residency audits | More infra to operate per region; cross-region reporting needs deliberate aggregation |
 
 ---
 
@@ -323,8 +409,8 @@ CREATE INDEX idx_audit_tenant_invoice     ON audit_logs(tenant_id, invoice_id, c
 
 ### Bedrock Instability (20% rate limit/timeout budget)
 
-- **Circuit breaker** (per tenant): trip after 3 consecutive Bedrock failures; fall back to cached extraction template + human review queue
-- **Retry with exponential backoff + jitter**: max 3 retries within 6s window
+- **Circuit breaker** (per tenant): trip after 3 consecutive Bedrock failures; route affected messages straight to the human review queue (no silent loss)
+- **Retry with exponential backoff + jitter**: base 1s, max 3 retries (~6s window)
 - **Model fallback chain**: Claude Haiku → Claude Sonnet → flag for human review (no silent failures)
 - **SQS message visibility timeout**: 30s; failed messages return to queue automatically → DLQ after 3 attempts
 - **DLQ alarm**: CloudWatch alarm fires if DLQ depth > 50 messages → PagerDuty
@@ -352,7 +438,7 @@ CREATE INDEX idx_audit_tenant_invoice     ON audit_logs(tenant_id, invoice_id, c
 | Conversational queries (est. 200k/month) | 200k × 2k input + 500 output | Mixed Haiku/Sonnet | $350 |
 | **Total AI spend** | | | **~$7,355/month** |
 
-> **Headroom: 59% of $18k budget** — leaves room for query volume growth 2.4× before budget is hit.
+> **Headroom: 59% of the $18k budget** — overall AI volume can grow ~2.4× before the cap is reached.
 
 ### Infrastructure (representative AWS costs)
 

@@ -2,8 +2,12 @@
 
 > Version 1.0 · June 2026 · Base URL: `https://api.invoices.{tenant}.example.com/v1`
 
-All endpoints require `Authorization: Bearer {JWT}` (Cognito-issued, tenant-scoped).  
-All responses include `X-Request-Id` and `X-Tenant-Id` headers.
+**Conventions**
+- All endpoints require `Authorization: Bearer {JWT}` (Cognito-issued, tenant-scoped) — **except** the inbound ERP webhook (§6a), which is authenticated by HMAC signature, not JWT.
+- All responses include `X-Request-Id` and `X-Tenant-Id` headers.
+- `POST /invoices/upload` accepts an optional `Idempotency-Key` header; replaying the same key returns the original `job_id` instead of creating a duplicate (safe client retries under provider instability).
+- Monetary values are always strings (e.g. `"12705.00"`) to avoid floating-point drift. Identifiers are prefixed ULIDs (`inv_`, `job_`, `ten_`, `usr_`, `esj_`).
+- `429` responses include a `Retry-After` header (seconds).
 
 ---
 
@@ -48,10 +52,11 @@ PRJ-2026-042
   "invoice_id": "inv_01HXYZ3K8MPQRS789ABCDEF",
   "status": "PROCESSING",
   "estimated_completion_seconds": 6,
-  "status_url": "/v1/invoices/inv_01HXYZ3K8MPQRS789ABCDEF",
-  "webhook_hint": "Register at /v1/webhooks to receive INVOICE_READY events"
+  "status_url": "/v1/invoices/inv_01HXYZ3K8MPQRS789ABCDEF"
 }
 ```
+
+> Poll `status_url` (P95 ~6s to a terminal state) or register a webhook at `/v1/webhooks` to receive `INVOICE_READY` / `INVOICE_NEEDS_REVIEW` / `INVOICE_REJECTED` events.
 
 **Error responses**
 
@@ -73,6 +78,8 @@ Retrieve a fully-extracted invoice with per-field confidence scores.
 GET /v1/invoices/inv_01HXYZ3K8MPQRS789ABCDEF
 Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
 ```
+
+> Add `?include=raw_fields` to also return each field's raw (pre-normalisation) value and Textract bounding box — used by the reviewer UI.
 
 **Response — 200 OK**
 ```json
@@ -106,17 +113,58 @@ Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
   "erp_sync": {
     "status": "SYNCED",
     "erp_id": "NS-VB-20260603-441",
-    "payment_status": "PENDING",
+    "payment_status": "UNPAID",
     "synced_at": "2026-06-03T09:20:00Z"
   }
 }
 ```
 
-**Status enum:** `PROCESSING` → `PENDING_REVIEW` → `VALIDATED` → `ERP_SYNCED` → `ERROR`
+**`status` enum (extraction lifecycle):** `PROCESSING` → then `REJECTED` (terminal — not an invoice or duplicate), `EXTRACTED` (auto, high confidence), or `PENDING_REVIEW` → `VALIDATED` (after human review); `FAILED` on pipeline error. When `status` is `REJECTED`, a `rejection_reason` ∈ `{NOT_AN_INVOICE, DUPLICATE}` is included and the source PDF is moved to a quarantine prefix (30-day lifecycle) rather than persisted as an invoice.
+
+ERP synchronisation is a **separate dimension**, reported in the `erp_sync` object — `status` ∈ `{PENDING, SYNCED, FAILED}`, `payment_status` ∈ `{UNPAID, PARTIAL, PAID}` — never folded into the top-level `status`.
 
 ---
 
-## 3. GET /invoices/search
+## 3. PATCH /invoices/{id}/fields
+
+Submit human-review corrections for a `PENDING_REVIEW` invoice. Called by the internal reviewer UI; every correction is audit-logged and the invoice is re-indexed for RAG.
+
+```http
+PATCH /v1/invoices/inv_01HXYZ3K8MPQRS789ABCDEF/fields
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
+
+{
+  "fields": {
+    "supplier_id": { "value": "ES-B12345678" },
+    "tax_amount":  { "value": "2205.00" }
+  },
+  "resolution": "APPROVED"
+}
+```
+
+**Response — 200 OK**
+```json
+{
+  "id": "inv_01HXYZ3K8MPQRS789ABCDEF",
+  "status": "VALIDATED",
+  "corrected_fields": ["supplier_id", "tax_amount"],
+  "reviewed_by": "usr_01HOPS",
+  "reviewed_at": "2026-06-03T10:02:00Z"
+}
+```
+
+Corrected fields are persisted with `source: "human"` and `confidence: 1.0`; the invoice transitions `PENDING_REVIEW → VALIDATED` and an `invoice.validated` event is emitted to EventBridge to trigger ERP sync.
+
+| Status | Code | Condition |
+|--------|------|-----------|
+| 404 | `INVOICE_NOT_FOUND` | Unknown id for this tenant |
+| 409 | `NOT_IN_REVIEW` | Invoice is not in `PENDING_REVIEW` |
+| 422 | `VALIDATION_FAILED` | Corrected values fail business rules (e.g. `subtotal + tax_amount ≠ total_amount`) |
+
+---
+
+## 4. GET /invoices/search
 
 Structured search with filtering, sorting, and pagination.
 
@@ -155,6 +203,7 @@ Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
 ```json
 {
   "total": 142,
+  "pages": 6,
   "page": 1,
   "limit": 25,
   "items": [
@@ -174,7 +223,7 @@ Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
 
 ---
 
-## 4. POST /assist/query
+## 5. POST /assist/query
 
 Natural language conversational interface for invoice data.
 
@@ -217,7 +266,7 @@ Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
 }
 ```
 
-> `sql_used` is returned only when `query_type = aggregation`. Free-form narrative queries return `rag_chunks_used` instead.
+> **`query_type`** is one of `aggregation` (SQL over Aurora), `semantic` (k-NN over OpenSearch), or `lookup` (single record). `sql_used` is returned for `aggregation`; `rag_chunks_used` (the matched invoice snippets) is returned for `semantic`. This mirrors the routing branch in System Design §4.3.
 
 **Streaming response** (SSE when `stream: true`):
 ```
@@ -229,9 +278,9 @@ data: {"done": true, "sources": [...]}
 
 ---
 
-## 5. ERP Webhooks
+## 6. ERP Webhooks
 
-### 5a. Inbound — ERP posts to platform
+### 6a. Inbound — ERP posts to platform
 
 ```http
 POST /v1/erp/webhook
@@ -256,7 +305,7 @@ X-ERP-Signature: sha256=abc123...   (HMAC-SHA256 of body with shared secret)
 
 **Signature verification failure → 401 Unauthorized**
 
-### 5b. GET /erp/sync/{id} — sync job status
+### 6b. GET /erp/sync/{id} — sync job status
 
 ```http
 GET /v1/erp/sync/esj_01HABC
