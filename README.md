@@ -90,10 +90,11 @@ charges.
 - The PyMuPDF Lambda layer is built through a local `pip` command in
   [`terraform/layers.tf`](terraform/layers.tf), targeting Python 3.12 Linux wheels.
 - After deployment, [`scripts/init_db.py`](scripts/init_db.py) creates the database schema.
-  It needs `boto3` and AWS credentials, and must be run from the repository root because it
-  reads Terraform outputs from `terraform/`.
+  It needs `boto3`, AWS credentials, the Terraform CLI on PATH, and an initialized, applied
+  state in `terraform/`. Run it from the repository root so it can read those outputs.
 - [`terraform/outputs.tf`](terraform/outputs.tf) defines the upload URL, review URL, database
-  identifiers, queue, and dashboard outputs. Use the API base URL to configure the frontend.
+  identifiers, queue, and dashboard outputs. For the frontend base URL, take `upload_url`
+  and remove its `/invoices/upload` suffix; there is no separate base-URL output.
 
 This is a development prototype, with no production authentication or tenant isolation wired
 into these routes. Use a deployment you control with synthetic invoice data when evaluating it.
